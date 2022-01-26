@@ -6,7 +6,7 @@
 # with a warning.
 bl_info = {
     "name": "3DMigoto",
-    "blender": (2, 80, 0),
+    "blender": (3, 0, 0),
     "author": "Ian Munsie (darkstarsword@gmail.com)",
     "location": "File > Import-Export",
     "description": "Imports meshes dumped with 3DMigoto's frame analysis and exports meshes suitable for re-injection",
@@ -26,6 +26,7 @@ bl_info = {
 # - Test in a wider variety of games
 # - Handle TANGENT better on both import & export?
 
+from asyncio.windows_events import NULL
 import io
 import re
 from array import array
@@ -38,6 +39,9 @@ from glob import glob
 import json
 import copy
 import textwrap
+import base64
+import string
+import random
 
 import bpy
 from bpy_extras.io_utils import unpack_list, ImportHelper, ExportHelper, axis_conversion
@@ -730,14 +734,23 @@ def import_vertex_groups(mesh, obj, blend_indices, blend_weights):
         # that they haven't been renumbered. Not positive whether it is better
         # to use the vertex group index, vertex group name or attach some extra
         # data. Make sure the indices and names match:
+
         num_vertex_groups = max(itertools.chain(*itertools.chain(*blend_indices.values()))) + 1
         for i in range(num_vertex_groups):
             obj.vertex_groups.new(name=str(i))
+
+        # num_vertex_groups = int((max(itertools.chain(*itertools.chain(*blend_indices.values()))) + 1) / 3) + 1
+
+        # obj['3DMigoto:VGCount'] = num_vertex_groups
+        # for i in range(num_vertex_groups):
+        #     obj.vertex_groups.new(name=str(i))
+        
         for vertex in mesh.vertices:
             for semantic_index in sorted(blend_indices.keys()):
                 for i, w in zip(blend_indices[semantic_index][vertex.index], blend_weights[semantic_index][vertex.index]):
                     if w == 0.0:
                         continue
+                    # i = int(i / 3)
                     obj.vertex_groups[i].add((vertex.index,), w, 'REPLACE')
 def import_uv_layers(mesh, obj, texcoords, flip_texcoord_v):
     for (texcoord, data) in sorted(texcoords.items()):
@@ -835,7 +848,7 @@ def import_faces_from_vb(mesh, vb):
     mesh.polygons.foreach_set('loop_start', [x*3 for x in range(num_faces)])
     mesh.polygons.foreach_set('loop_total', [3] * num_faces)
 
-def import_vertices(mesh, vb):
+def import_vertices(mesh, vb, import_fix_nioh2):
     mesh.vertices.add(len(vb.vertices))
 
     seen_offsets = set()
@@ -913,9 +926,13 @@ def import_vertices(mesh, vb):
         #        assert(data[l.vertex_index][3] in (1.0, -1.0))
         #        l.tangent[:] = data[l.vertex_index][0:3]
             print('NOTICE: Skipping import of %s in favour of recalculating on export' % elem.name)
-        elif translated_elem_name.startswith('BLENDINDICES'):
+        elif translated_elem_name == 'BLENDINDICES' and import_fix_nioh2:
             blend_indices[elem.SemanticIndex] = data
-        elif translated_elem_name.startswith('BLENDWEIGHT'):
+        elif translated_elem_name == 'BLENDWEIGHT' and import_fix_nioh2:
+            blend_weights[elem.SemanticIndex] = data
+        elif translated_elem_name.startswith('BLENDINDICES') and not import_fix_nioh2:
+            blend_indices[elem.SemanticIndex] = data
+        elif translated_elem_name.startswith('BLENDWEIGHT') and not import_fix_nioh2:
             blend_weights[elem.SemanticIndex] = data
         elif translated_elem_name.startswith('TEXCOORD') and elem.is_float():
             texcoords[elem.SemanticIndex] = data
@@ -938,11 +955,17 @@ def import_3dmigoto(operator, context, paths, merge_meshes=True, **kwargs):
         # FIXME: Group objects together
         return obj
 
-def import_3dmigoto_vb_ib(operator, context, paths, flip_texcoord_v=True, axis_forward='-Z', axis_up='Y', pose_cb_off=[0,0], pose_cb_step=1):
+def import_3dmigoto_vb_ib(operator, context, paths, flip_texcoord_v=True, axis_forward='-Z', axis_up='Y', pose_cb_off=[0,0], pose_cb_step=1, import_fix_nioh2=True, import_textures=True):
     vb, ib, name, pose_path = load_3dmigoto_mesh(operator, paths)
 
     mesh = bpy.data.meshes.new(name)
     obj = bpy.data.objects.new(mesh.name, mesh)
+
+    # Store hashes for .ini generation when exporting
+    obj['3DMigoto:VBHash'] = name[11:19]
+    obj['3DMigoto:VBHashJoin'] = ""
+    obj['3DMigoto:VSHash'] = name[23:39]
+    obj['3DMigoto:PSHash'] = name[43:59]
 
     global_matrix = axis_conversion(from_forward=axis_forward, from_up=axis_up).to_4x4()
     obj.matrix_world = global_matrix
@@ -961,7 +984,7 @@ def import_3dmigoto_vb_ib(operator, context, paths, flip_texcoord_v=True, axis_f
     else:
         import_faces_from_vb(mesh, vb)
 
-    (blend_indices, blend_weights, texcoords, vertex_layers, use_normals) = import_vertices(mesh, vb)
+    (blend_indices, blend_weights, texcoords, vertex_layers, use_normals) = import_vertices(mesh, vb, import_fix_nioh2)
 
     import_uv_layers(mesh, obj, texcoords, flip_texcoord_v)
 
@@ -984,6 +1007,8 @@ def import_3dmigoto_vb_ib(operator, context, paths, flip_texcoord_v=True, axis_f
     select_set(obj, True)
     set_active_object(context, obj)
 
+    store_textures(obj, paths, import_textures)
+
     if pose_path is not None:
         import_pose(operator, context, pose_path, limit_bones_to_vertex_groups=True,
                 axis_forward=axis_forward, axis_up=axis_up,
@@ -991,6 +1016,31 @@ def import_3dmigoto_vb_ib(operator, context, paths, flip_texcoord_v=True, axis_f
         set_active_object(context, obj)
 
     return obj
+
+def store_textures(obj, paths, import_textures):
+    obj['3DMigoto:Textures'] = []
+
+    if not import_textures:
+        return
+    
+    vbfile = paths[0][0]
+    dirname = os.path.dirname(vbfile)
+    prefix = os.path.basename(vbfile)[0:6]
+    texture_paths = glob(os.path.join(dirname, prefix + "*.dds"))
+
+    textures = []
+    for texture_path in texture_paths:
+        name = os.path.basename(texture_path)
+        data = open(texture_path, 'rb').read()
+
+        # Skip those 1 pixel textures, they seem to cause weird light flickering issues
+        if len(data) <= 144:
+            continue
+
+        encoded = base64.b64encode(data)
+        textures.append((name, encoded))
+    
+    obj['3DMigoto:Textures'] = textures
 
 # from export_obj:
 def mesh_triangulate(me):
@@ -1009,6 +1059,10 @@ def blender_vertex_to_3dmigoto_vertex(mesh, obj, blender_loop_vertex, layout, te
     # TODO: Warn if vertex is in too many vertex groups for this layout,
     # ignoring groups with weight=0.0
     vertex_groups = sorted(blender_vertex.groups, key=lambda x: x.weight, reverse=True)
+    # vertex_groups = [x for x in vertex_groups if obj.vertex_groups[x.group].index <= obj['3DMigoto:VGCount']]
+
+
+    # if ignore_non_numeric_vertex_groups:
 
     for elem in layout:
         if elem.InputSlotClass != 'per-vertex':
@@ -1053,7 +1107,12 @@ def blender_vertex_to_3dmigoto_vertex(mesh, obj, blender_loop_vertex, layout, te
             pass
         elif elem.name.startswith('BLENDINDICES'):
             i = elem.SemanticIndex * 4
-            vertex[elem.name] = elem.pad([ x.group for x in vertex_groups[i:i+4] ], 0)
+            e = elem.pad([ x.group for x in vertex_groups[i:i+4] ], 0)
+            # e[0] = e[0] * 3
+            # e[1] = e[1] * 3
+            # e[2] = e[2] * 3
+            # e[3] = e[3] * 3
+            vertex[elem.name] = e
         elif elem.name.startswith('BLENDWEIGHT'):
             # TODO: Warn if vertex is in too many vertex groups for this layout
             i = elem.SemanticIndex * 4
@@ -1092,9 +1151,9 @@ def write_fmt_file(f, vb, ib):
         f.write('format: %s\n' % ib.format)
     f.write(vb.layout.to_string())
 
-def export_3dmigoto(operator, context, vb_path, ib_path, fmt_path):
-    obj = context.object
 
+
+def export_3dmigoto(operator, context, obj, vb_path, ib_path, fmt_path):
     if obj is None:
         raise Fatal('No object selected')
 
@@ -1115,10 +1174,37 @@ def export_3dmigoto(operator, context, vb_path, ib_path, fmt_path):
         raise Fatal('FIXME: Add capability to export without an index buffer')
     else:
         ib = IndexBuffer(ib_format)
+    
 
-    # Calculates tangents and makes loop normals valid (still with our
-    # custom normal data from import time):
-    mesh.calc_tangents()
+    # Nioh 2 - calculate tangents using a rotated version of the uvs
+    #          definitely a better way than this but it works,
+    #          however still not perfect because original tangents are lost?
+    if operator.fix_normals_nioh2:
+        try:
+            if mesh.uv_layers['TEXCOORD.xy']:
+                uv_name = 'TEXCOORD.xy rotated'
+                mesh.uv_layers.new(name=uv_name)
+
+                uv_layer = mesh.uv_layers[uv_name]
+
+                for l in mesh.loops:
+                    uv_layer.data[l.index].uv = mesh.uv_layers['TEXCOORD.xy'].data[l.index].uv
+
+                rotate_uv = lambda uv: (uv[1], 1.5 - uv[0])
+
+                for l in mesh.loops:
+                    uv_layer.data[l.index].uv = rotate_uv(uv_layer.data[l.index].uv)
+                
+                mesh.calc_tangents(uvmap='TEXCOORD.xy rotated')
+                
+                mesh.uv_layers.remove(mesh.uv_layers[uv_name])
+        
+        except:
+            # Calculates tangents and makes loop normals valid (still with our
+            # custom normal data from import time):
+            mesh.calc_tangents()
+    else:
+        mesh.calc_tangents()
 
     texcoord_layers = {}
     for uv_layer in mesh.uv_layers:
@@ -1190,47 +1276,59 @@ class Import3DMigotoFrameAnalysis(bpy.types.Operator, ImportHelper, IOOBJOrienta
     bl_options = {'PRESET', 'UNDO'}
 
     filename_ext = '.txt'
-    filter_glob = StringProperty(
+    filter_glob: StringProperty(
             default='*.txt',
             options={'HIDDEN'},
             )
 
-    files = CollectionProperty(
+    files: CollectionProperty(
             name="File Path",
             type=bpy.types.OperatorFileListElement,
             )
 
-    flip_texcoord_v = BoolProperty(
+    import_fix_nioh2: BoolProperty(
+            name="Import Fix (Nioh 2)",
+            description="Uses only the first BLENDINDICIES and BLENDWEIGHTS elements, can enable importing certain meshes like the Master Swordsman Robe torso",
+            default=True,
+            )
+
+    import_textures: BoolProperty(
+            name="Import textures",
+            description="Attach related textures onto the object for export",
+            default=True,
+            )
+
+    flip_texcoord_v: BoolProperty(
             name="Flip TEXCOORD V",
             description="Flip TEXCOORD V asix during importing",
             default=True,
             )
 
-    load_related = BoolProperty(
+    load_related: BoolProperty(
             name="Auto-load related meshes",
             description="Automatically load related meshes found in the frame analysis dump",
             default=True,
             )
 
-    load_buf = BoolProperty(
+    load_buf: BoolProperty(
             name="Load .buf files instead",
             description="Load the mesh from the binary .buf dumps instead of the .txt files\nThis will load the entire mesh as a single object instead of separate objects from each draw call",
             default=False,
             )
 
-    merge_meshes = BoolProperty(
+    merge_meshes: BoolProperty(
             name="Merge meshes together",
             description="Merge all selected meshes together into one object. Meshes must be related",
             default=False,
             )
 
-    pose_cb = StringProperty(
+    pose_cb: StringProperty(
             name="Bone CB",
             description='Indicate a constant buffer slot (e.g. "vs-cb2") containing the bone matrices',
             default="",
             )
 
-    pose_cb_off = bpy.props.IntVectorProperty(
+    pose_cb_off: bpy.props.IntVectorProperty(
             name="Bone CB range",
             description='Indicate start and end offsets (in multiples of 4 component values) to find the matrices in the Bone CB',
             default=[0,0],
@@ -1238,7 +1336,7 @@ class Import3DMigotoFrameAnalysis(bpy.types.Operator, ImportHelper, IOOBJOrienta
             min=0,
             )
 
-    pose_cb_step = bpy.props.IntProperty(
+    pose_cb_step: bpy.props.IntProperty(
             name="Vertex group step",
             description='If used vertex groups are 0,1,2,3,etc specify 1. If they are 0,3,6,9,12,etc specify 3',
             default=1,
@@ -1335,17 +1433,17 @@ class Import3DMigotoRaw(bpy.types.Operator, ImportHelper, IOOBJOrientationHelper
     bl_options = {'UNDO'}
 
     filename_ext = '.vb;.ib'
-    filter_glob = StringProperty(
+    filter_glob: StringProperty(
             default='*.vb;*.ib',
             options={'HIDDEN'},
             )
 
-    files = CollectionProperty(
+    files: CollectionProperty(
             name="File Path",
             type=bpy.types.OperatorFileListElement,
             )
 
-    flip_texcoord_v = BoolProperty(
+    flip_texcoord_v: BoolProperty(
             name="Flip TEXCOORD V",
             description="Flip TEXCOORD V asix during importing",
             default=True,
@@ -1399,7 +1497,7 @@ class Import3DMigotoReferenceInputFormat(bpy.types.Operator, ImportHelper):
     bl_options = {'UNDO', 'INTERNAL'}
 
     filename_ext = '.txt;.fmt'
-    filter_glob = StringProperty(
+    filter_glob: StringProperty(
             default='*.txt;*.fmt',
             options={'HIDDEN'},
             )
@@ -1440,9 +1538,15 @@ class Export3DMigoto(bpy.types.Operator, ExportHelper):
     bl_label = "Export 3DMigoto Vertex & Index Buffers"
 
     filename_ext = '.vb'
-    filter_glob = StringProperty(
+    filter_glob: StringProperty(
             default='*.vb',
             options={'HIDDEN'},
+            )
+
+    fix_normals_nioh2: BoolProperty(
+            name="Fix normals (Nioh 2)",
+            description="Rotates UVs before calculating tangents",
+            default=True,
             )
 
     def execute(self, context):
@@ -1453,9 +1557,291 @@ class Export3DMigoto(bpy.types.Operator, ExportHelper):
 
             # FIXME: ExportHelper will check for overwriting vb_path, but not ib_path
 
-            export_3dmigoto(self, context, vb_path, ib_path, fmt_path)
+            export_3dmigoto(self, context, context.object, vb_path, ib_path, fmt_path)
         except Fatal as e:
             self.report({'ERROR'}, str(e))
+        return {'FINISHED'}
+
+# Strip special characters and replace whitespace with an underscore
+def safe_name(name):
+    name = '_'.join(name.split())
+    name = re.sub(r'\W+', '', name)
+    return name
+
+class Export3DMigotoNioh2Mod(bpy.types.Operator, ExportHelper):
+    """Export meshes and textures, and generate an .ini"""
+    bl_idname = "export_mesh.migoto_nioh2_mod"
+    bl_label = "Export 3DMigoto Nioh 2 Mod"
+
+    filename_ext = ".ini"
+
+    fix_normals_nioh2: BoolProperty(
+            default=True,
+            options={'HIDDEN'},
+            )
+
+    mod_name: StringProperty(
+            name="Mod name",
+            description="A unique name used in the .ini to avoid conflicts",
+            default="MyMod",
+            )
+
+    subfolder_meshes: StringProperty(
+            name="Meshes subfolder",
+            description="Name of the subfolder that meshes will be exported into",
+            default="meshes",
+            )
+
+    subfolder_textures: StringProperty(
+            name="Textures subfolder",
+            description="Name of the subfolder that textures will be exported into",
+            default="textures",
+            )
+
+    write_ini: BoolProperty(
+            name="Write INI",
+            description="Write an .ini file",
+            default=True,
+            )
+
+    write_meshes: BoolProperty(
+            name="Export meshes",
+            description="Export meshes and include them in the .ini",
+            default=True,
+            )
+
+    write_textures: BoolProperty(
+            name="Export textures",
+            description="Export textures and include them in the .ini",
+            default=False,
+            )
+
+    overwrite: BoolProperty(
+            name="Overwrite",
+            description="Overwrite existing meshes and textures",
+            default=True,
+            )
+    
+    def execute(self, context):
+
+        if len(context.selected_objects) < 1:
+            raise Fatal('No objects selected')
+        
+        self.subfolder_meshes = safe_name(self.subfolder_meshes)
+        self.subfolder_textures = safe_name(self.subfolder_textures)
+        meshes_dir = os.path.join(os.path.dirname(self.filepath), self.subfolder_meshes)
+        textures_dir = os.path.join(os.path.dirname(self.filepath), self.subfolder_textures)
+        
+        # Write meshes
+        
+        if self.write_meshes:
+            if not os.path.exists(meshes_dir):
+                os.mkdir(meshes_dir)
+
+            for selected_object in context.selected_objects:
+                mesh_name = safe_name(selected_object.name)
+                vb_path = os.path.join(meshes_dir, mesh_name + '.vb')
+                ib_path = os.path.join(meshes_dir, mesh_name + '.ib')
+                fmt_path = os.path.join(meshes_dir, mesh_name + '.fmt')
+
+                if os.path.exists(vb_path) and self.overwrite is False:
+                    continue
+
+                export_3dmigoto(self, context, selected_object, vb_path, ib_path, fmt_path)
+
+        # Write textures
+
+        if self.write_textures:
+            if not os.path.exists(textures_dir):
+                os.mkdir(textures_dir)
+
+            for selected_object in context.selected_objects:
+                mesh_name = safe_name(selected_object.name)
+
+                for texture in selected_object['3DMigoto:Textures']:
+                    texture_number = os.path.basename(texture[0])[29:34]
+                    texture_name = mesh_name + "_" + str(texture_number) + ".dds"
+                    texture_path = os.path.join(textures_dir, texture_name)
+
+                    if os.path.exists(texture_path) and self.overwrite is False:
+                        continue
+                    
+                    file = open(texture_path, 'wb')
+                    file.write(base64.b64decode(texture[1]))
+                    file.close()
+
+        # Write ini
+
+        if self.write_ini:
+            ini_shader_overrides = {}
+            ini_texture_overrides = {}
+            ini_vb_resources = {}
+            ini_ib_resources = {}
+            ini_texture_resources = {}
+            mod_name = safe_name(self.mod_name)
+            ini_name = safe_name(os.path.splitext(os.path.basename(self.filepath))[0])
+
+            # Make the shader override text for the ini
+
+            ps_hashes = []
+            for selected_object in context.selected_objects:
+                ps_hashes.append(selected_object['3DMigoto:PSHash'])
+            ps_hashes = list(set(ps_hashes))
+
+            index = 0
+            for ps_hash in ps_hashes:
+                ini_shader_overrides[ps_hash] = []
+                ini_shader_overrides[ps_hash].append("[ShaderOverride_" + mod_name + "_" + ini_name + "_" + str(index) + "]")
+                ini_shader_overrides[ps_hash].append("hash = " + ps_hash)
+                ini_shader_overrides[ps_hash].append("run = CommandListN2General")
+                ini_shader_overrides[ps_hash].append("allow_duplicate_hash = overrule")
+                index += 1
+            
+            if self.write_meshes:
+                
+                # make this part less redundant and confusing
+                selected_objects_list = context.selected_objects
+                objects_waiting_to_join = []
+                for selected_object in selected_objects_list:
+
+                    mesh_name = safe_name(selected_object.name)
+                    vb_resource_name = "Resource_VB_" + mod_name + "_" + ini_name + "_" + mesh_name
+                    ib_resource_name = "Resource_IB_" + mod_name + "_" + ini_name + "_" + mesh_name
+
+                    if selected_object in objects_waiting_to_join:
+                        if selected_object['3DMigoto:VBHashJoin'] not in ini_texture_overrides.keys():
+                            raise Fatal("Object \"" + selected_object.name + "\" failed joining, hash \"" + vbhashjoin + "\" not found in selected objects")
+                    else:
+
+                        # Make the vb and ib resource text for the ini
+
+
+                        ini_vb_resources[vb_resource_name] = []
+                        ini_vb_resources[vb_resource_name].append("[" + vb_resource_name + "]")
+                        ini_vb_resources[vb_resource_name].append("type = Buffer")
+                        ini_vb_resources[vb_resource_name].append("stride = " + str(selected_object['3DMigoto:VBStride']))
+                        ini_vb_resources[vb_resource_name].append("filename = " + os.path.join(self.subfolder_meshes, mesh_name + '.vb'))
+
+                        ini_ib_resources[ib_resource_name] = []
+                        ini_ib_resources[ib_resource_name].append("[" + ib_resource_name + "]")
+                        ini_ib_resources[ib_resource_name].append("type = Buffer")
+                        ini_ib_resources[ib_resource_name].append("format = " + selected_object['3DMigoto:IBFormat'])
+                        ini_ib_resources[ib_resource_name].append("filename = " + os.path.join(self.subfolder_meshes, mesh_name + '.ib'))
+
+                    # Make the mesh edit portion of the texture override text for the ini
+
+                    vbhash = selected_object['3DMigoto:VBHash']
+                    # Check for objects we want to be joining
+                    vbhashjoin = selected_object['3DMigoto:VBHashJoin']
+                    if vbhashjoin != "":
+                        # Add this object to the end of the list if we haven't found an object with the right vb hash
+                        if vbhashjoin not in ini_texture_overrides.keys():
+                            objects_waiting_to_join.append(selected_object)
+                            selected_objects_list.append(selected_object)
+                            continue
+                        else:
+                            vbhash = vbhashjoin
+                    
+                    # Only make one texture override for each vb hash
+                    if vbhash not in ini_texture_overrides.keys():
+                        ini_texture_overrides[vbhash] = []
+                        ini_texture_overrides[vbhash].append("[TextureOverride_" + mod_name + "_" + ini_name + "_" + mesh_name + "]")
+                        ini_texture_overrides[vbhash].append("hash = " + vbhash)
+                        ini_texture_overrides[vbhash].append("handling = skip")
+                        ini_texture_overrides[vbhash].append("match_first_index = " + str(selected_object['3DMigoto:FirstIndex']))
+                    
+                    # Allow multiple meshes with the same vb hash to be added to a single texture override
+                    ini_texture_overrides[vbhash].append("vb0 = " + vb_resource_name)
+                    ini_texture_overrides[vbhash].append("ib = " + ib_resource_name)
+                    ini_texture_overrides[vbhash].append("drawindexed = auto")
+
+            if self.write_textures:
+                for selected_object in context.selected_objects:
+
+                    # Make the texture resource text for the ini
+
+                    mesh_name = safe_name(selected_object.name)
+
+                    for texture in selected_object['3DMigoto:Textures']:
+                        texture_number = os.path.basename(texture[0])[29:34]
+                        texture_name = mesh_name + "_" + str(texture_number) + ".dds"
+                        texture_path = os.path.join(self.subfolder_textures, texture_name)
+                        texture_resource_name = "Resource_Texture_" + mod_name + "_" + ini_name + "_" + mesh_name + "_" + texture_number
+                        ini_texture_resources[texture_resource_name] = []
+                        ini_texture_resources[texture_resource_name].append("[" + texture_resource_name + "]")
+                        ini_texture_resources[texture_resource_name].append("filename = " + texture_path)
+                    
+                    # Make the texture portion texture override text for the ini
+
+                    if selected_object['3DMigoto:VBHashJoin'] != "":
+                        vbhash = selected_object['3DMigoto:VBHashJoin']
+                    else:
+                        vbhash = selected_object['3DMigoto:VBHash']
+
+                    # All vb hashes will be in the dict if we're exporting meshes, so append the textures to them
+                    if vbhash in ini_texture_overrides.keys():
+                        for to_index, to_text in enumerate(ini_texture_overrides[vbhash]):
+                            if to_text == "ib = " + "Resource_IB_" + mod_name + "_" + ini_name + "_" + mesh_name:
+                                offset = 1
+                                for tr_name in ini_texture_resources.keys():
+                                    if "Resource_Texture_" + mod_name + "_" + ini_name + "_" + mesh_name + "_" in tr_name:
+                                        tr_name_split = tr_name.split('_')
+                                        tr_number = tr_name_split[len(tr_name_split)-1]
+                                        ini_texture_overrides[vbhash].insert(to_index + offset, tr_number + " = " + tr_name)
+                                        offset += 1
+                                break
+
+                    # vb hashes won't be in the dict if we aren't exporting meshes, so create new texture overrides just for the textures
+                    else:
+                        ini_texture_overrides[vbhash] = []
+                        ini_texture_overrides[vbhash].append("[TextureOverride_" + mod_name + "_" + ini_name + "_" + mesh_name + "]")
+                        ini_texture_overrides[vbhash].append("hash = " + selected_object['3DMigoto:VBHash'])
+                        for tr_name in ini_texture_resources.keys():
+                            if "Resource_Texture_" + mod_name + "_" + ini_name + "_" + mesh_name + "_" in tr_name:
+                                tr_name_split = tr_name.split('_')
+                                tr_number = tr_name_split[len(tr_name_split)-1]
+                                ini_texture_overrides[vbhash].append(tr_number + " = " + tr_name)
+
+            # Put ini data we gathered into a string
+
+            ini_text = "; Shader overrides\n"
+
+            for so in ini_shader_overrides:
+                for text in ini_shader_overrides[so]:
+                    ini_text += text + "\n"
+            
+            ini_text += "\n; Texture overrides\n"
+
+            for to in ini_texture_overrides:
+                for text in ini_texture_overrides[to]:
+                    ini_text += text + "\n"
+            
+            ini_text += "\n; Vertex buffer resources\n"
+
+            for vbr in ini_vb_resources:
+                for text in ini_vb_resources[vbr]:
+                    ini_text += text + "\n"
+                
+            ini_text += "\n; Index buffer resources\n"
+
+            for ibr in ini_ib_resources:
+                for text in ini_ib_resources[ibr]:
+                    ini_text += text + "\n"
+
+            ini_text += "\n; Texture resources\n"
+
+            for tr in ini_texture_resources:
+                for text in ini_texture_resources[tr]:
+                    ini_text += text + "\n"
+
+            # Write the ini file
+
+            file = open(self.filepath, 'w')
+            file.write(ini_text)
+            file.close()
+
+            self.report({'INFO'}, "Exported successfully")
+
         return {'FINISHED'}
 
 def apply_vgmap(operator, context, targets=None, filepath='', commit=False, reverse=False, suffix='', rename=False, cleanup=False):
@@ -1464,7 +1850,7 @@ def apply_vgmap(operator, context, targets=None, filepath='', commit=False, reve
 
     if not targets:
         raise Fatal('No object selected')
-
+    
     vgmap = json.load(open(filepath, 'r'))
 
     if reverse:
@@ -1524,7 +1910,7 @@ class ApplyVGMap(bpy.types.Operator, ImportHelper):
     bl_options = {'UNDO'}
 
     filename_ext = '.vgmap'
-    filter_glob = StringProperty(
+    filter_glob: StringProperty(
             default='*.vgmap',
             options={'HIDDEN'},
             )
@@ -1535,25 +1921,25 @@ class ApplyVGMap(bpy.types.Operator, ImportHelper):
     #        default=False,
     #        )
 
-    rename = BoolProperty(
+    rename: BoolProperty(
             name="Rename existing vertex groups",
             description="Rename existing vertex groups to match the vgmap file",
             default=True,
             )
 
-    cleanup = BoolProperty(
+    cleanup: BoolProperty(
             name="Remove non-listed vertex groups",
             description="Remove any existing vertex groups that are not listed in the vgmap file",
             default=False,
             )
 
-    reverse = BoolProperty(
+    reverse: BoolProperty(
             name="Swap from & to",
             description="Switch the order of the vertex group map - if this mesh is the 'to' and you want to use the bones in the 'from'",
             default=False,
             )
 
-    suffix = StringProperty(
+    suffix: StringProperty(
             name="Suffix",
             description="Suffix to add to the vertex buffer filename when exporting, for bulk exports of a single mesh with multiple distinct vertex group maps",
             default='',
@@ -1577,7 +1963,7 @@ class UpdateVGMap(bpy.types.Operator):
     bl_label = "Assign new 3DMigoto vertex groups"
     bl_options = {'UNDO'}
 
-    vg_step = bpy.props.IntProperty(
+    vg_step: bpy.props.IntProperty(
             name="Vertex group step",
             description='If used vertex groups are 0,1,2,3,etc specify 1. If they are 0,3,6,9,12,etc specify 3',
             default=1,
@@ -1670,18 +2056,18 @@ class Import3DMigotoPose(bpy.types.Operator, ImportHelper, IOOBJOrientationHelpe
     bl_options = {'UNDO'}
 
     filename_ext = '.txt'
-    filter_glob = StringProperty(
+    filter_glob: StringProperty(
             default='*.txt',
             options={'HIDDEN'},
             )
 
-    limit_bones_to_vertex_groups = BoolProperty(
+    limit_bones_to_vertex_groups: BoolProperty(
             name="Limit Bones to Vertex Groups",
             description="Limits the maximum number of bones imported to the number of vertex groups of the active object",
             default=True,
             )
 
-    pose_cb_off = bpy.props.IntVectorProperty(
+    pose_cb_off: bpy.props.IntVectorProperty(
             name="Bone CB range",
             description='Indicate start and end offsets (in multiples of 4 component values) to find the matrices in the Bone CB',
             default=[0,0],
@@ -1689,7 +2075,7 @@ class Import3DMigotoPose(bpy.types.Operator, ImportHelper, IOOBJOrientationHelpe
             min=0,
             )
 
-    pose_cb_step = bpy.props.IntProperty(
+    pose_cb_step: bpy.props.IntProperty(
             name="Vertex group step",
             description='If used vertex groups are 0,1,2,3,etc specify 1. If they are 0,3,6,9,12,etc specify 3',
             default=1,
@@ -1798,20 +2184,480 @@ class Merge3DMigotoPose(bpy.types.Operator):
             self.report({'ERROR'}, str(e))
         return {'FINISHED'}
 
-class DeleteNonNumericVertexGroups(bpy.types.Operator):
-    """Remove vertex groups with non-numeric names"""
-    bl_idname = "vertex_groups.delete_non_numeric"
-    bl_label = "Remove non-numeric vertex groups"
+class GenerateIniScript(bpy.types.Operator):
+    """Create ini script for selected meshes and copy it to clipboard"""
+    bl_idname = "object.meshes_to_migotoini"
+    bl_label = "Generate 3DMigoto INI"
     bl_options = {'UNDO'}
 
     def execute(self, context):
         try:
+            script = ""
             for obj in context.selected_objects:
-                for vg in reversed(obj.vertex_groups):
-                    if vg.name.isdecimal():
+                string = obj.data.name
+                findvb0 = string.find('-vb0=')
+                findvs = string.find('-vs=')
+                vb0 = string[findvb0 + 5 : findvs]
+                script += "[TextureOverride_" + obj.name + "]\n"
+                script += "hash = " + vb0 + "\n"
+                script += "handling = skip\n"
+                script += "match_first_index = " + str(obj['3DMigoto:FirstIndex']) + "\n"
+                script += "vb0 = Resource_" + obj.name + "_VB\n"
+                script += "ib = Resource_" + obj.name + "_IB\n"
+                script += "drawindexed = auto\n"
+                script += "[Resource_" + obj.name + "_VB]\n"
+                script += "type = Buffer\n"
+                script += "stride = " + str(obj['3DMigoto:VBStride']) + "\n"
+                script += "filename = meshes\\" + obj.name + ".vb\n"
+                script += "[Resource_" + obj.name + "_IB]\n"
+                script += "type = Buffer\n"
+                script += "format = " + obj['3DMigoto:IBFormat'] + "\n"
+                script += "filename = meshes\\" + obj.name + ".ib\n"
+                script += "\n"
+
+            bpy.context.window_manager.clipboard = script    
+            self.report({'INFO'}, "Copied ini script to clipboard")
+        except Fatal as e:
+            self.report({'ERROR'}, str(e))
+        return {'FINISHED'}
+
+# FIXME: cobbled together pile of poop
+class MatchVertexGroups(bpy.types.Operator):
+    """Match active object's vertex groups to selected object's vertex groups"""
+    bl_idname = "vertex_groups.match_vertex_groups"
+    bl_label = "Match 3DMigoto Vertex Groups"
+    bl_options = {'UNDO'}
+
+    def execute(self, context):
+        try:
+
+            active = context.active_object
+            selected = None
+
+            selected_objects_list = context.selected_objects
+
+            if len(selected_objects_list) != 2:
+                raise Fatal('Must select exactly 2 objects')
+            
+            for obj in selected_objects_list:
+                if obj != active:
+                    selected = obj
+            
+            bpy.ops.object.mode_set(mode='OBJECT')
+            bpy.ops.object.select_all(action='DESELECT')
+
+            # Create armatures if they don't exist
+            just_created_armatures = False
+            for obj in selected_objects_list:
+                obj.select_set(True)
+                armature = bpy.context.scene.objects.get(obj['3DMigoto:VBHash'] + 'arm')
+                if armature:
+                    continue
+                # Create armature
+                armature = bpy.data.armatures.new('Armature')
+                armature_object = bpy.data.objects.new(obj['3DMigoto:VBHash'] + 'arm', armature)
+                bpy.data.collections[0].objects.link(armature_object)
+                armature.show_names = True
+                armature_object.show_in_front = True
+                if obj != active:
+                    armature_object.display_type = 'WIRE'
+                # Parent it to obj
+                bpy.context.view_layer.objects.active = armature_object
+                bpy.ops.object.parent_set(type='ARMATURE_NAME')
+                obj.select_set(False)
+                armature_object.select_set(False)
+                bpy.context.view_layer.update()
+                just_created_armatures = True
+
+            bpy.ops.object.select_all(action='DESELECT')
+            
+            active.select_set(True)
+            selected.select_set(True)
+            bpy.context.view_layer.objects.active = active
+            bpy.context.view_layer.update()
+
+            bpy.ops.object.mode_set( mode = 'EDIT' )
+
+            for obj in selected_objects_list:
+
+                if obj != active:
+                    selected = obj
+                
+                # Get center of vertex groups and create bones for armatures
+                if just_created_armatures == True:
+
+                    print ("Finding positions of " + obj.name + " vertex groups")
+
+                    for group in obj.vertex_groups:
+                        if not group.name.isdecimal():
+                            continue
+
+                        if int(group.name) % 3 != 0 and int(group.name) != 0:
+                            continue
+
+                        obj.vertex_groups.active = group
+                            
+                        verts = [ v for v in obj.data.vertices if obj.vertex_groups.active_index in [ vg.group for vg in v.groups ] ]
+
+                        weightedSum = Vector((0, 0, 0))
+                        sumOfWeights = 0
+                        center = Vector((0, 0, 0))
+
+                        for v in verts:
+                                
+                            weight = 0
+
+                            for vertsGroup in v.groups:
+                                if vertsGroup.group == group.index:
+                                    weight = vertsGroup.weight
+                                
+                            weightedSum.x += v.co.x * weight
+                            weightedSum.y += v.co.y * weight
+                            weightedSum.z += v.co.z * weight
+                            sumOfWeights += weight
+                            
+                        if sumOfWeights == 0:
+                            continue
+                            
+                        center.x = weightedSum.x / sumOfWeights
+                        center.y = weightedSum.y / sumOfWeights
+                        center.z = weightedSum.z / sumOfWeights
+
+                        # Add bones
+                        bone_name = group.name
+                        bpy.ops.object.mode_set(mode='OBJECT')
+                        armature_object = bpy.data.objects[obj['3DMigoto:VBHash'] + 'arm']
+                        bpy.context.view_layer.objects.active = armature_object
+                        bpy.ops.object.mode_set( mode = 'EDIT' )
+                        edit_bones = armature_object.data.edit_bones
+                        edit_bone = edit_bones.new(bone_name)
+                        head = obj.matrix_world @ center
+                        tail = head + Vector((0, -10, 0))
+                        edit_bone.head = head
+                        edit_bone.tail = tail
+                        if obj == selected:
+                            edit_bone.lock = True
+                        print("created " + obj.name + " " + edit_bone.name + " " + str(head))
+                        bpy.ops.object.mode_set(mode='OBJECT')
+                        bpy.context.view_layer.objects.active = active
+                        armature_object.select_set(False)
+                        bpy.ops.object.mode_set( mode = 'EDIT' )
+
+
+            if just_created_armatures:
+                bpy.ops.object.mode_set(mode='OBJECT')
+                self.report({'INFO'}, 'Armatures created, manually adjust bones and then run again')
+            else:
+
+                active_positions = {}
+                selected_positions = {}
+                
+
+                for obj in context.selected_objects:
+                    bpy.ops.object.mode_set(mode='OBJECT')
+                    armature_object = bpy.data.objects[obj['3DMigoto:VBHash'] + 'arm']
+                    bpy.context.view_layer.objects.active = armature_object
+                    bpy.ops.object.mode_set( mode = 'EDIT' )
+                    edit_bones = armature_object.data.edit_bones
+                    for edit_bone in edit_bones:
+                        if obj == active:
+                            active_positions[edit_bone.name] = Vector(edit_bone.head)
+                        else:
+                            selected_positions[edit_bone.name] = Vector(edit_bone.head)
+                    bpy.ops.object.mode_set(mode='OBJECT')
+                    bpy.context.view_layer.objects.active = active
+                    armature_object.select_set(False)
+                    bpy.ops.object.mode_set( mode = 'EDIT' )
+
+                # Match active to selected positions
+
+
+                matched = {}
+                matched_distance = {}
+                
+                for active_vg, active_pos in active_positions.items():
+
+                    for selected_vg, selected_pos in selected_positions.items():
+                        
+                        distance = (selected_pos - active_pos).length
+                        
+                        # Selected vg hasn't been matched yet
+                        if selected_vg not in matched.values():
+
+                            # We're already matched
+                            if active_vg in matched.keys():
+                                # This is closer to us than our previous match
+                                if distance < matched_distance[active_vg]:
+                                    matched[active_vg] = selected_vg
+                                    matched_distance[active_vg] = distance
+                                # Our previous match is closer
+                                else:
+                                    continue
+                            # We're not matched yet
+                            else:
+                                matched[active_vg] = selected_vg
+                                matched_distance[active_vg] = distance
+                                continue
+                        # Selected vg is matched already
+                        else:
+                            # We're already matched
+                            if active_vg in matched.keys():
+                                # This is closer to us than our previous match
+                                if distance < matched_distance[active_vg]:
+                                    # Get the previously matched vg
+                                    previous_distance = 0
+                                    for previous_active_vg in matched.keys():
+                                        if selected_vg == matched[previous_active_vg]:
+                                            previous_distance = matched_distance[previous_active_vg]
+                                            previous_match = previous_active_vg
+                                    # We're closer than the previous match
+                                    if distance < previous_distance:
+                                        matched[active_vg] = selected_vg
+                                        matched_distance[active_vg] = distance
+                                        matched.pop(previous_match, None)
+                                        matched_distance.pop(previous_match, None)
+
+                                        print("removing " + previous_match + ", no matches found")
+                                        continue
+                                    else:
+                                        continue
+                                # Our previous match is closer
+                                else:
+                                    continue
+                            # We're not matched yet
+                            else:
+                                # Get the previously matched vg
+                                previous_distance = 0
+                                for previous_active_vg in matched.keys():
+                                    if selected_vg == matched[previous_active_vg]:
+                                        previous_distance = matched_distance[previous_active_vg]
+                                        previous_match = previous_active_vg
+                                # We're closer than the previous match
+                                if distance < previous_distance:
+                                    matched[active_vg] = selected_vg
+                                    matched_distance[active_vg] = distance
+                                    matched.pop(previous_match, None)
+                                    matched_distance.pop(previous_match, None)
+
+                                    print("removing " + previous_match + ", no matches found")
+                                    continue
+                                else:
+                                    continue
+
+                # Add any missing numeric vertex groups
+
+                print ("Adding missing groups")
+
+                bpy.ops.object.mode_set( mode = 'EDIT' )
+
+                for selected_vg in selected.vertex_groups:
+                    if selected_vg.name.isnumeric() is False:
                         continue
-                    print('Removing vertex group', vg.name)
-                    obj.vertex_groups.remove(vg)
+                    
+                    missing = True
+                    for active_vg in active.vertex_groups:
+                        if active_vg.name == selected_vg.name:
+                            missing = False
+                            break
+                    
+                    if missing:
+                        active.vertex_groups.new(name=selected_vg.name)
+                
+                # Duplicate the vertex groups we want to change and clear the original
+
+                print ("Duplicating groups and clearing the originals")
+
+                for active_vg in matched.keys():
+                    bpy.ops.object.vertex_group_set_active(group=active_vg)
+                    bpy.ops.object.vertex_group_copy()
+
+                for vg in active.vertex_groups:
+                    if vg.name.isnumeric():
+                        bpy.ops.object.vertex_group_set_active(group=vg.name)
+                        bpy.ops.object.vertex_group_remove_from(use_all_groups=False, use_all_verts=True)
+
+                # Rename unused bones
+
+                # or not because this automatically renames the vertex groups for some reason
+
+                # bpy.ops.object.mode_set(mode='OBJECT')
+                # bpy.ops.object.select_all(action='DESELECT')
+                # bpy.context.view_layer.update()
+                # armature_object = bpy.data.objects[active['3DMigoto:VBHash'] + 'arm']
+                # bpy.context.view_layer.objects.active = armature_object
+                # bpy.context.view_layer.update()
+                # bpy.ops.object.mode_set( mode = 'EDIT' )
+                # edit_bones = armature_object.data.edit_bones
+                # for edit_bone in edit_bones:
+                #     if edit_bone.name in matched.keys():
+                #         edit_bone.name = edit_bone.name + " -> " + matched[edit_bone.name]
+                #     else:
+                #         edit_bone.name = edit_bone.name + " (unused)"
+                # bpy.ops.object.mode_set(mode='OBJECT')
+                # bpy.ops.object.select_all(action='DESELECT')
+                # active.select_set(True)
+                # selected.select_set(True)
+                # bpy.context.view_layer.objects.active = active
+                # bpy.context.view_layer.update()
+                # bpy.ops.object.mode_set( mode = 'EDIT' )
+                
+                # Delete groups that we'll be renaming our copies to
+
+                print ("Deleting groups that the copies will be renamed to")
+
+                vgs_to_delete = []
+                for vg in active.vertex_groups:
+                    for selected_vg in matched.values():
+                        if vg.name == selected_vg:
+                            vgs_to_delete.append(vg.name)
+
+                for vg in vgs_to_delete:
+                    for active_vg in active.vertex_groups:
+                        if active_vg.name == vg:
+                            active.vertex_groups.remove(active_vg)
+                
+                # Sort by distance, closets first
+
+                print ("Sorting by distance")
+
+                dict(sorted(matched.items(), key=lambda x: (active_positions[x[0]] - selected_positions[x[1]]).length, reverse=True))
+                for a, s in matched.items():
+                    dist = (active_positions[a] - selected_positions[s]).length
+                    # print(a + " - " + s + ": " + str(dist)[0:6])
+                
+                # Rename the active copies to their selected name, deleting duplicates
+
+                print ("Renaming copies")
+
+                renamed = []
+                vgs_to_delete = []
+                for vg in active.vertex_groups:
+                    for active_vg, selected_vg in matched.items():
+                        if vg.name == active_vg + "_copy":
+                            if selected_vg in renamed:
+                                vgs_to_delete.append(vg.name)
+                            else:
+                                vg.name = selected_vg
+                                renamed.append(selected_vg)
+                            break
+                
+                print ("Deleting duplicates")
+
+                # for vg in vgs_to_delete:
+                #     for active_vg in active.vertex_groups:
+                #         if active_vg.name == vg:
+                #             active.vertex_groups.remove(active_vg)
+
+                for vg in vgs_to_delete:
+                    for active_vg in active.vertex_groups:
+                        if active_vg.name == vg:
+                            active_vg.name = "No match - " + active_vg.name.split('_')[0]
+
+                
+                
+                bpy.ops.object.vertex_group_sort(sort_type='NAME')
+
+                bpy.ops.object.mode_set( mode = 'OBJECT' )
+
+                # Delete armatures
+                bpy.ops.object.select_all(action='DESELECT')
+                bpy.data.objects[active['3DMigoto:VBHash'] + 'arm'].select_set(True)
+                bpy.data.objects[selected['3DMigoto:VBHash'] + 'arm'].select_set(True)
+                bpy.ops.object.delete()
+                active.select_set(True)
+                selected.select_set(True)
+                bpy.context.view_layer.objects.active = active
+                
+                print("active: " + str(len(active_positions)) + " selected: " + str(len(selected_positions)))
+                for active_vg, selected_vg in matched.items():
+                    print(active.name + " " + str(active_vg) + " with " + str(selected_vg))
+                
+                self.report({'INFO'}, "Matched vertex groups successfully")
+                
+        except Fatal as e:
+            self.report({'ERROR'}, str(e))
+        return {'FINISHED'}
+
+class Transfer3DMigotoData(bpy.types.Operator):
+    """Transfer all 3DMigoto data from selected to active object"""
+    bl_idname = "object.transfer_3dmigoto_data"
+    bl_label = "Transfer 3DMigoto Data"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    # extend: BoolProperty(name="Append", description="Appends new curves to already existing Particle hair strands", default=True)
+    FirstIndex: bpy.props.BoolProperty(
+            name='FirstIndex',
+            default=False,
+            )
+    FirstVertex: bpy.props.BoolProperty(
+            name='FirstVertex',
+            default=False,
+            )
+    IBFormat: bpy.props.BoolProperty(
+            name='IBFormat',
+            default=False,
+            )
+    PSHash: bpy.props.BoolProperty(
+            name='PSHash',
+            default=False,
+            )
+    TEXCOORDxy: bpy.props.BoolProperty(
+            name='TEXCOORD.xy',
+            default=False,
+            )
+    Textures: bpy.props.BoolProperty(
+            name='Textures',
+            default=False,
+            )
+    VBHash: bpy.props.BoolProperty(
+            name='VBHash',
+            default=False,
+            )
+    VBHashJoin: bpy.props.BoolProperty(
+            name='VBHashJoin',
+            default=False,
+            )
+    VBLayout: bpy.props.BoolProperty(
+            name='VBLayout',
+            default=False,
+            )
+    VBStride: bpy.props.BoolProperty(
+            name='VBStride',
+            default=False,
+            )
+    VSHash: bpy.props.BoolProperty(
+            name='VSHash',
+            default=False,
+            )
+    VBHashtoVBHashJoin: bpy.props.BoolProperty(
+            name='VBHash to VBHashJoin',
+            default=False,
+            )
+
+    def execute(self, context):
+        try:
+            active = context.active_object
+            
+            for selected in context.selected_objects:
+                if selected == active:
+                    continue
+                
+                if self.FirstIndex: active['3DMigoto:FirstIndex'] = selected['3DMigoto:FirstIndex']
+                if self.FirstVertex: active['3DMigoto:FirstVertex'] = selected['3DMigoto:FirstVertex']
+                if self.IBFormat: active['3DMigoto:IBFormat'] = selected['3DMigoto:IBFormat']
+                if self.PSHash: active['3DMigoto:PSHash'] = selected['3DMigoto:PSHash']
+                if self.TEXCOORDxy: active['3DMigoto:TEXCOORD.xy'] = selected['3DMigoto:TEXCOORD.xy']
+                if self.Textures: active['3DMigoto:Textures'] = selected['3DMigoto:Textures']
+                if self.VBHash: active['3DMigoto:VBHash'] = selected['3DMigoto:VBHash']
+                if self.VBHashJoin: active['3DMigoto:VBHashJoin'] = selected['3DMigoto:VBHashJoin']
+                if self.VBLayout: active['3DMigoto:VBLayout'] = selected['3DMigoto:VBLayout']
+                if self.VBStride: active['3DMigoto:VBStride'] = selected['3DMigoto:VBStride']
+                if self.VSHash: active['3DMigoto:VSHash'] = selected['3DMigoto:VSHash']
+                if self.VBHashtoVBHashJoin: active['3DMigoto:VBHashJoin'] = selected['3DMigoto:VBHash']
+
+                self.report({'INFO'}, "Data transfered successfuly")
+                break
+
         except Fatal as e:
             self.report({'ERROR'}, str(e))
         return {'FINISHED'}
@@ -1828,6 +2674,9 @@ def menu_func_import_pose(self, context):
 def menu_func_export(self, context):
     self.layout.operator(Export3DMigoto.bl_idname, text="3DMigoto raw buffers (.vb + .ib)")
 
+def menu_func_export_nioh2mod(self, context):
+    self.layout.operator(Export3DMigotoNioh2Mod.bl_idname, text="3DMigoto Nioh 2 mod")
+
 def menu_func_apply_vgmap(self, context):
     self.layout.operator(ApplyVGMap.bl_idname, text="Apply 3DMigoto vertex group map to current object (.vgmap)")
 
@@ -1836,11 +2685,14 @@ register_classes = (
     Import3DMigotoRaw,
     Import3DMigotoReferenceInputFormat,
     Export3DMigoto,
+    Export3DMigotoNioh2Mod,
     ApplyVGMap,
     UpdateVGMap,
     Import3DMigotoPose,
     Merge3DMigotoPose,
-    DeleteNonNumericVertexGroups,
+    GenerateIniScript,
+    MatchVertexGroups,
+    Transfer3DMigotoData,
 )
 
 def register():
@@ -1851,6 +2703,7 @@ def register():
     import_menu.append(menu_func_import_fa)
     import_menu.append(menu_func_import_raw)
     export_menu.append(menu_func_export)
+    export_menu.append(menu_func_export_nioh2mod)
     import_menu.append(menu_func_apply_vgmap)
     import_menu.append(menu_func_import_pose)
 
@@ -1861,6 +2714,7 @@ def unregister():
     import_menu.remove(menu_func_import_fa)
     import_menu.remove(menu_func_import_raw)
     export_menu.remove(menu_func_export)
+    export_menu.append(menu_func_export_nioh2mod)
     import_menu.remove(menu_func_apply_vgmap)
     import_menu.remove(menu_func_import_pose)
 
