@@ -1027,16 +1027,22 @@ def store_textures(obj, paths, import_textures):
     dirname = os.path.dirname(vbfile)
     prefix = os.path.basename(vbfile)[0:6]
     texture_paths = glob(os.path.join(dirname, prefix + "*.dds"))
-
+    
     textures = []
+    used_hashes = []
     for texture_path in texture_paths:
         name = os.path.basename(texture_path)
+        thash = name[name.index("-ps-t")+7:len(name)-4]
+        if thash in used_hashes:
+            continue
+        used_hashes.append(thash)
+
         data = open(texture_path, 'rb').read()
 
         # Skip those 1 pixel textures, they seem to cause weird light flickering issues
         if len(data) <= 144:
             continue
-
+        
         encoded = base64.b64encode(data)
         textures.append((name, encoded))
     
@@ -1659,7 +1665,7 @@ class Export3DMigotoNioh2Mod(bpy.types.Operator, ExportHelper):
                 mesh_name = safe_name(selected_object.name)
 
                 for texture in selected_object['3DMigoto:Textures']:
-                    texture_number = os.path.basename(texture[0])[29:34]
+                    texture_number = texture[0][texture[0].index("-ps-t")+1:texture[0].index("-ps-t")+6]
                     texture_name = mesh_name + "_" + str(texture_number) + ".dds"
                     texture_path = os.path.join(textures_dir, texture_name)
 
@@ -1763,7 +1769,7 @@ class Export3DMigotoNioh2Mod(bpy.types.Operator, ExportHelper):
                     mesh_name = safe_name(selected_object.name)
 
                     for texture in selected_object['3DMigoto:Textures']:
-                        texture_number = os.path.basename(texture[0])[29:34]
+                        texture_number = texture[0][texture[0].index("-ps-t")+1:texture[0].index("-ps-t")+6]
                         texture_name = mesh_name + "_" + str(texture_number) + ".dds"
                         texture_path = os.path.join(self.subfolder_textures, texture_name)
                         texture_resource_name = "Resource_Texture_" + mod_name + "_" + ini_name + "_" + mesh_name + "_" + texture_number
